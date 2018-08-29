@@ -688,9 +688,13 @@ EXPORT_SYMBOL(bgcom_close);
 static irqreturn_t bg_irq_tasklet_hndlr(int irq, void *device)
 {
 	struct bg_spi_priv *bg_spi = device;
+
 	/* check if call-back exists */
-	if (list_empty(&cb_head)) {
-		pr_debug("No callback registered\n");
+	if (!atomic_read(&bg_is_spi_active)) {
+		printk_ratelimited("Interrupt received in suspend state\n");
+		return IRQ_HANDLED;
+	} else if (list_empty(&cb_head)) {
+		pr_err("No callback registered\n");
 		return IRQ_HANDLED;
 	} else if (spi_state == BGCOM_SPI_BUSY) {
 		return IRQ_HANDLED;
@@ -779,8 +783,52 @@ static int bg_spi_remove(struct spi_device *spi)
 	mutex_destroy(&bg_spi->xfer_mutex);
 	devm_kfree(&spi->dev, bg_spi);
 	spi_set_drvdata(spi, NULL);
-
+	if (fxd_mem_buffer != NULL)
+		kfree(fxd_mem_buffer);
+	mutex_destroy(&cma_buffer_lock);
 	return 0;
+}
+
+static void bg_spi_shutdown(struct spi_device *spi)
+{
+	bg_spi_remove(spi);
+}
+
+static int bgcom_pm_suspend(struct device *dev)
+{
+	uint32_t cmnd_reg = 0;
+	struct spi_device *s_dev = to_spi_device(dev);
+	struct bg_spi_priv *bg_spi = spi_get_drvdata(s_dev);
+	int ret = 0;
+
+	if (bg_spi->bg_state == BGCOM_STATE_SUSPEND)
+		return 0;
+
+	cmnd_reg |= BIT(31);
+	ret = read_bg_locl(BGCOM_WRITE_REG, 1, &cmnd_reg);
+	if (ret == 0) {
+		bg_spi->bg_state = BGCOM_STATE_SUSPEND;
+		atomic_set(&bg_is_spi_active, 0);
+		disable_irq(bg_irq);
+	}
+	pr_info("suspended with : %d\n", ret);
+	return ret;
+}
+
+static int bgcom_pm_resume(struct device *dev)
+{
+	struct bg_context clnt_handle;
+	int ret;
+	struct bg_spi_priv *spi =
+		container_of(bg_com_drv, struct bg_spi_priv, lhandle);
+
+	clnt_handle.bg_spi = spi;
+	atomic_set(&bg_is_spi_active, 1);
+	ret = bgcom_resume(&clnt_handle);
+	if (ret == 0)
+		enable_irq(bg_irq);
+	pr_info("Bgcom resumed with : %d\n", ret);
+	return ret;
 }
 
 static const struct of_device_id bg_spi_of_match[] = {
